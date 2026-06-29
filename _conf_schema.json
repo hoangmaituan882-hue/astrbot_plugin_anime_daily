@@ -6,9 +6,9 @@
         "default": []
     },
     "group_list_mode": {
-        "description": "L1:名单模式 — whitelist(只在列表) | blacklist(除列表外) | none(全部启用,忽略列表)",
+        "description": "名单模式 — whitelist(只在列表) | blacklist(除列表外,默认) | none(全部启用)",
         "type": "string",
-        "default": "whitelist",
+        "default": "blacklist",
         "options": ["whitelist", "blacklist", "none"]
     },
     "push_time": {

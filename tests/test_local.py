@@ -47,13 +47,21 @@ def test_config_defaults():
     assert_eq(c.push_time, "23:00", "push_time default")
     assert_eq(c.top_n_users, 10, "top_n_users default")
     assert_eq(c.max_messages_per_llm_call, 300, "max default")
-    assert_eq(c.group_list_mode, "whitelist", "默认 whitelist")
+    assert_eq(c.group_list_mode, "blacklist", "默认 blacklist(全部启用,除非排除)")
     assert_eq(c.report_format, "text", "默认 text")
-    assert_eq(c.is_group_enabled(None), False, "L1:None 在 whitelist 下拒绝")
-    assert_eq(c.is_group_enabled("g1"), False, "空白名单(g1 不在)拒绝")
-    c2 = PluginConfig.from_raw({"enabled_groups": ["g1"], "top_n_users": 7})
-    assert_eq(c2.is_group_enabled("g1"), True, "白名单 g1 放行")
-    assert_eq(c2.is_group_enabled("g2"), False, "白名单 g2 拒绝")
+    # 默认 blacklist + 空白名单 → 所有群启用(包括 g1)
+    assert_eq(c.is_group_enabled("g1"), True, "默认 blacklist 空白名单 → g1 启用")
+    assert_eq(c.is_group_enabled("g2"), True, "默认 blacklist 空白名单 → g2 启用")
+    # 显式 whitelist
+    c2 = PluginConfig.from_raw(
+        {
+            "enabled_groups": ["g1"],
+            "top_n_users": 7,
+            "group_list_mode": "whitelist",
+        }
+    )
+    assert_eq(c2.is_group_enabled("g1"), True, "whitelist g1 放行")
+    assert_eq(c2.is_group_enabled("g2"), False, "whitelist g2 拒绝")
     assert_eq(c2.get_push_hour_minute(), (23, 0), "默认 23:00")
     c3 = PluginConfig.from_raw({"push_time": "07:30"})
     assert_eq(c3.get_push_hour_minute(), (7, 30), "解析 07:30")
@@ -82,11 +90,11 @@ def test_config_group_list_modes():
     )
     assert_eq(cn.is_group_enabled("g1"), True, "none g1 放行")
     assert_eq(cn.is_group_enabled("g3"), True, "none g3 放行")
-    # 非法 mode 回退到 whitelist
+    # 非法 mode 回退到 blacklist
     cf = PluginConfig.from_raw(
         {"enabled_groups": ["g1"], "group_list_mode": "garbage"}
     )
-    assert_eq(cf.group_list_mode, "whitelist", "非法 mode 回退")
+    assert_eq(cf.group_list_mode, "blacklist", "非法 mode 回退到 blacklist")
 
 
 def test_config_report_format():

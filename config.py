@@ -13,7 +13,7 @@ class PluginConfig:
     """从 _conf_schema.json 加载并经过类型校验的运行时配置。"""
 
     enabled_groups: list[str] = field(default_factory=list)
-    group_list_mode: GroupListMode = "whitelist"
+    group_list_mode: GroupListMode = "blacklist"
     push_time: str = "23:00"
     top_n_users: int = 10
     top_n_works: int = 5
@@ -33,9 +33,9 @@ class PluginConfig:
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> "PluginConfig":
         """从 AstrBotConfig(继承自 dict)构造,做基础类型校验与缺省。"""
-        mode = str(raw.get("group_list_mode", "whitelist")).lower()
+        mode = str(raw.get("group_list_mode", "blacklist")).lower()
         if mode not in ("whitelist", "blacklist", "none"):
-            mode = "whitelist"
+            mode = "blacklist"
         fmt = str(raw.get("report_format", "text")).lower()
         if fmt not in ("text", "html"):
             fmt = "text"
