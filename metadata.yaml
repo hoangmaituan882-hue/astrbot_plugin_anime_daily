@@ -1,6 +1,6 @@
 name: astrbot_plugin_anime_daily
 desc: 每天 23:00 自动汇总当日群内动画话题,生成话痨榜与热门作品榜,并在群内推送全服总榜。
-author: your_name
+author: hoangmaituan882-hue
 version: 1.0.0
 repo: https://github.com/hoangmaituan882-hue/astrbot_plugin_anime_daily
 

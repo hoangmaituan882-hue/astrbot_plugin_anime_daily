@@ -17,10 +17,12 @@ class PluginConfig:
     top_n_global_works: int = 8
     include_global_in_group: bool = True
     push_on_empty: bool = True
+    push_on_error: bool = True
     quiet_min_words: int = 2
     max_messages_per_llm_call: int = 300
     llm_temperature: float = 0.1
     summary_max_words: int = 60
+    max_concurrent_llm: int = 3
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> "PluginConfig":
@@ -34,10 +36,12 @@ class PluginConfig:
             top_n_global_works=int(raw.get("top_n_global_works", 8)),
             include_global_in_group=bool(raw.get("include_global_in_group", True)),
             push_on_empty=bool(raw.get("push_on_empty", True)),
+            push_on_error=bool(raw.get("push_on_error", True)),
             quiet_min_words=int(raw.get("quiet_min_words", 2)),
             max_messages_per_llm_call=int(raw.get("max_messages_per_llm_call", 300)),
             llm_temperature=float(raw.get("llm_temperature", 0.1)),
             summary_max_words=int(raw.get("summary_max_words", 60)),
+            max_concurrent_llm=max(1, int(raw.get("max_concurrent_llm", 3))),
         )
 
     def is_group_enabled(self, group_id: str | None) -> bool:

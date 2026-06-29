@@ -20,7 +20,7 @@ env/
 htmlcov/
 
 # Plugin 运行时数据(开发原则:数据放 data 目录,不入库)
-data/
+# data/ 目录本身保留(用 .gitkeep 占位),只忽略真实数据库文件
 *.db
 *.db-wal
 *.db-shm

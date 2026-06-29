@@ -1,4 +1,4 @@
-"""本地聚合工具:消息分块(时间窗) + 多块 LLM 结果合并。"""
+"""本地聚合工具:消息分块(时间窗) + 多块 LLM 结果合并 + 全服合并。"""
 from __future__ import annotations
 
 WINDOW_SECONDS = 30 * 60
@@ -50,6 +50,30 @@ def chunk_messages(
 def _norm_work_key(work: str) -> str:
     """作品名归一化键:小写 + 去空白。"""
     return work.strip().lower().replace(" ", "")
+
+
+def _pick_best_quote(quotes: list[str]) -> str:
+    """B4:从一组 quote 中选最精炼的一条(<=20 字)优先,否则取最短。
+
+    理由:金句通常是 4~12 字的短评;长 quote 反而像凑字数的口水话。
+    """
+    if not quotes:
+        return ""
+    # 去重(B19)
+    seen: set[str] = set()
+    unique = []
+    for q in quotes:
+        q = q.strip()
+        if q and q not in seen:
+            seen.add(q)
+            unique.append(q)
+    # 优先短且非空
+    short_pool = [q for q in unique if 0 < len(q) <= 20]
+    if short_pool:
+        # 短池里再取最长(避免一个 2 字的"嗯"赢过一个 15 字的金句)
+        return max(short_pool, key=len)
+    # 否则取最短的(防止超长口水话)
+    return min(unique, key=len)
 
 
 def merge_partial_results(partials: list[dict]) -> dict:
@@ -113,9 +137,7 @@ def merge_partial_results(partials: list[dict]) -> dict:
     anime_user_stats: list[dict] = []
     for u in user_agg.values():
         quotes = u.pop("_quotes", [])
-        # 选最长的 quote 作为 best_quote
-        best_quote = max(quotes, key=len) if quotes else ""
-        u["best_quote"] = best_quote
+        u["best_quote"] = _pick_best_quote(quotes)
         anime_user_stats.append(u)
 
     anime_user_stats.sort(
@@ -140,7 +162,6 @@ def merge_partial_results(partials: list[dict]) -> dict:
             else:
                 cur["count"] += cnt
                 cur["_aliases"].add(name)
-                # 偏好中文译名:含中文字符的最长别名
                 cur["work"] = _pick_preferred_name(cur["_aliases"])
 
     top_works = [
@@ -156,7 +177,7 @@ def merge_partial_results(partials: list[dict]) -> dict:
         for p in partials
         if (p.get("summary") or "").strip()
     ]
-    summary = " | ".join(summary_parts)
+    summary = " · ".join(summary_parts)
 
     return {
         "is_anime_day": is_anime_day,
@@ -186,21 +207,19 @@ def truncate_summary(text: str, max_words: int) -> str:
 
 
 def merge_global_results(per_group: list[dict]) -> dict:
-    """合并多群分析为全服总榜(本地,无 LLM)。
+    """B5:全服榜跨群合并 user(去掉 group_id/group_name 字段,口径与 LLM 一致)。
 
-    输入 per_group: 每个元素是 merge_partial_results 的输出,
-                    额外带 group_id/group_name 字段。
+    输入 per_group: 每个元素是 merge_partial_results 的输出 + group_id/group_name。
     输出:
       {
         "global_user_top": [
-          {"user_id","user_name","group_id","group_name",
-           "anime_msg_count","best_quote"}, ...
+          {"user_id","user_name","anime_msg_count","best_quote"}, ...
         ],
         "global_works_top": [{"work","total_count"}, ...],
         "summary": str   -- 由各群 summary 拼接
       }
     """
-    user_agg: dict[tuple[str, str], dict] = {}
+    user_agg: dict[str, dict] = {}
     work_agg: dict[str, dict] = {}
     summaries: list[str] = []
 
@@ -215,16 +234,15 @@ def merge_global_results(per_group: list[dict]) -> dict:
             uid = str(u.get("user_id", ""))
             if not uid:
                 continue
-            key = (uid, gid)
+            # B5 关键:按 user_id 跨群合并(不再用 (uid, gid) 复合键)
             cur = user_agg.setdefault(
-                key,
+                uid,
                 {
                     "user_id": uid,
                     "user_name": u.get("user_name") or uid,
-                    "group_id": gid,
-                    "group_name": gname,
                     "anime_msg_count": 0,
                     "_quotes": [],
+                    "_groups": set(),
                 },
             )
             cur["anime_msg_count"] += int(u.get("anime_msg_count", 0) or 0)
@@ -233,6 +251,8 @@ def merge_global_results(per_group: list[dict]) -> dict:
                 cur["_quotes"].append(q)
             if u.get("user_name"):
                 cur["user_name"] = u["user_name"]
+            if gname:
+                cur["_groups"].add(gname)
 
         for w in g.get("top_works", []) or []:
             name = str(w.get("work", "")).strip()
@@ -255,7 +275,9 @@ def merge_global_results(per_group: list[dict]) -> dict:
     global_user_top: list[dict] = []
     for v in user_agg.values():
         quotes = v.pop("_quotes", [])
-        v["best_quote"] = max(quotes, key=len) if quotes else ""
+        groups = v.pop("_groups", set())
+        v["best_quote"] = _pick_best_quote(quotes)
+        v["group_count"] = len(groups)  # 跨了几个群(信息保留,渲染可选)
         global_user_top.append(v)
     global_user_top.sort(key=lambda x: -int(x.get("anime_msg_count", 0) or 0))
 
@@ -269,5 +291,5 @@ def merge_global_results(per_group: list[dict]) -> dict:
     return {
         "global_user_top": global_user_top,
         "global_works_top": global_works_top,
-        "summary": " | ".join(summaries),
+        "summary": " · ".join(summaries),
     }

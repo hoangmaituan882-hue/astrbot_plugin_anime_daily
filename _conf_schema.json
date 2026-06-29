@@ -44,6 +44,16 @@
         "type": "bool",
         "default": true
     },
+    "push_on_error": {
+        "description": "B10:LLM 分析失败时是否发送错误提示(独立于 push_on_empty)",
+        "type": "bool",
+        "default": true
+    },
+    "max_concurrent_llm": {
+        "description": "B12:同时进行的 LLM 调用数上限(避免撞 rate limit)",
+        "type": "int",
+        "default": 3
+    },
     "quiet_min_words": {
         "description": "低于该字数的消息不计入(过滤表情/单字)",
         "type": "int",

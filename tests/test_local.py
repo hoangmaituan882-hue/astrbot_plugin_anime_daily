@@ -168,13 +168,17 @@ def test_merge_partials_normal():
     assert_eq(u1["related_msg_count"], 13, "u1 related 累加")
     # 排序 u1 在前
     assert_eq(r["anime_user_stats"][0]["user_id"], "u1", "u1 排序第一")
+    # B4:best_quote 取短(<20 字)且最长,候选 "同意"(2 字) vs "孤独摇滚第十集封神"(10 字)
+    # 短池里有 2 字和 10 字,选最长 → 10 字
+    assert_eq(u1["best_quote"], "孤独摇滚第十集封神", "u1 best_quote 精炼")
     # 作品归一化:本地只做小写+去空白,跨语种归一化靠 LLM。
     # 所以 "孤独摇滚"(两处,大小写空白相同)合并,日文别名独立保留。
     works = {w["work"]: w["count"] for w in r["top_works"]}
     assert_eq(works.get("孤独摇滚", 0), 9, "孤独摇滚大小写空白归一累加")
     assert_eq(works.get("ぼっち・ざ・ろっく!", 0), 1, "日文别名独立")
     assert_eq(works.get("葬送的芙莉莲", 0), 4, "芙莉莲保留")
-    assert_eq(" | " in r["summary"], True, "summary 拼接")
+    # B17:分隔符改为 ·
+    assert_eq(" · " in r["summary"], True, "summary 拼接")
 
 
 def test_merge_partials_all_false():
@@ -214,28 +218,24 @@ def test_merge_global():
         "summary": "新番前瞻",
     }
     r = merge_global_results([g1, g2])
-    # 跨群榜保留 (user_id, group_id) 区分:u1 在 g1 和 g2 是不同行
-    # 但全局排序按 anime_msg_count desc
-    g1_u1 = next(
-        u for u in r["global_user_top"]
-        if u["user_id"] == "u1" and u["group_id"] == "g1"
-    )
-    g2_u1 = next(
-        u for u in r["global_user_top"]
-        if u["user_id"] == "u1" and u["group_id"] == "g2"
-    )
-    assert_eq(g1_u1["anime_msg_count"], 5, "u1@ g1 = 5")
-    assert_eq(g2_u1["anime_msg_count"], 4, "u1@ g2 = 4")
+    # B5:跨群合并 user — u1 跨 g1+g2 合并为一行
+    u1 = next(u for u in r["global_user_top"] if u["user_id"] == "u1")
+    assert_eq(u1["anime_msg_count"], 9, "u1 跨群合并 = 5+4")
+    assert_eq(u1.get("group_count"), 2, "u1 跨 2 群")
     # u2 anime=7
     u2 = next(u for u in r["global_user_top"] if u["user_id"] == "u2")
     assert_eq(u2["anime_msg_count"], 7, "u2")
-    # 排序: u2(7) > u1@g1(5) > u1@g2(4)
+    # 排序: u1(9) > u2(7)
     order = [u["anime_msg_count"] for u in r["global_user_top"]]
-    assert_eq(order, [7, 5, 4], "排序正确")
+    assert_eq(order, [9, 7], "B5 排序")
+    # 不再带 group_id/group_name
+    assert_eq("group_id" in u1, False, "B5 不再带 group_id")
     # 作品:跨语种归一化靠 LLM;同语种累加
     works = {w["work"]: w["total_count"] for w in r["global_works_top"]}
     assert_eq(works.get("孤独摇滚", 0), 9, "孤独摇滚跨群 9")
     assert_eq(works.get("葬送的芙莉莲", 0), 4, "芙莉莲 4")
+    # B17
+    assert_eq(" · " in r["summary"], True, "global summary 分隔符")
 
 
 def test_merge_case_insensitive():
@@ -379,64 +379,88 @@ async def test_storage():
         db_path = os.path.join(tmp, "test.db")
         s = Storage(db_path)
         await s.init()
-        await s.insert_message(
-            date_str="2026-06-29",
-            group_id="g1",
-            group_name="测试群",
-            user_id="u1",
-            user_name="小明",
-            message_id="m1",
-            raw_text="孤独摇滚第十集封神",
-            created_at=1000,
-        )
-        await s.insert_message(
-            date_str="2026-06-29",
-            group_id="g1",
-            group_name="测试群",
-            user_id="u2",
-            user_name="阿绿",
-            message_id="m2",
-            raw_text="BD 出了吗",
-            created_at=2000,
-        )
-        await s.insert_message(
-            date_str="2026-06-30",
-            group_id="g1",
-            group_name="测试群",
-            user_id="u1",
-            user_name="小明",
-            message_id="m3",
-            raw_text="今天天气真好",
-            created_at=3000,
-        )
-        by_g = await s.get_messages_by_group("2026-06-29")
-        assert_eq(len(by_g), 1, "29 日 1 群")
-        assert_eq(len(by_g["g1"]), 2, "29 日 g1 共 2 条")
-        assert_eq(by_g["g1"][0]["user_id"], "u1", "按 ts 升序")
+        try:
+            await s.insert_message(
+                date_str="2026-06-29",
+                group_id="g1",
+                group_name="测试群",
+                user_id="u1",
+                user_name="小明",
+                message_id="m1",
+                raw_text="孤独摇滚第十集封神",
+                umo="aiocqhttp:GroupMessage:g1:m1",
+                created_at=1000,
+            )
+            await s.insert_message(
+                date_str="2026-06-29",
+                group_id="g1",
+                group_name="测试群",
+                user_id="u2",
+                user_name="阿绿",
+                message_id="m2",
+                raw_text="BD 出了吗",
+                umo="aiocqhttp:GroupMessage:g1:m2",
+                created_at=2000,
+            )
+            await s.insert_message(
+                date_str="2026-06-30",
+                group_id="g1",
+                group_name="测试群",
+                user_id="u1",
+                user_name="小明",
+                message_id="m3",
+                raw_text="今天天气真好",
+                umo="aiocqhttp:GroupMessage:g1:m3",
+                created_at=3000,
+            )
 
-        all_29 = await s.get_all_messages("2026-06-29")
-        assert_eq(len(all_29), 2, "29 日全部 2 条")
+            # B1:umo 缓存
+            umo = await s.get_latest_umo("g1")
+            assert_eq(umo, "aiocqhttp:GroupMessage:g1:m3", "B1 latest umo")
 
-        u1_msgs = await s.get_user_messages("u1", "2026-06-29")
-        assert_eq(len(u1_msgs), 1, "u1 29 日 1 条")
+            by_g = await s.get_messages_by_group("2026-06-29")
+            assert_eq(len(by_g), 1, "29 日 1 群")
+            assert_eq(len(by_g["g1"]), 2, "29 日 g1 共 2 条")
+            assert_eq(by_g["g1"][0]["user_id"], "u1", "按 ts 升序")
 
-        u1_all = await s.get_user_messages("u1")
-        assert_eq(len(u1_all), 2, "u1 全部 2 条")
+            all_29 = await s.get_all_messages("2026-06-29")
+            assert_eq(len(all_29), 2, "29 日全部 2 条")
 
-        # 缓存
-        await s.save_analysis_cache(
-            "2026-06-29", "group:g1", {"is_anime_day": True, "k": "v"}
-        )
-        c = await s.get_analysis_cache("2026-06-29", "group:g1")
-        assert_eq(c is not None and c.get("k") == "v", True, "cache 读写")
+            u1_msgs = await s.get_user_messages("u1", "2026-06-29")
+            assert_eq(len(u1_msgs), 1, "u1 29 日 1 条")
 
-        # push_log
-        assert_eq(await s.has_pushed("2026-06-29", "g1", "group"), False, "未推")
-        await s.mark_pushed("2026-06-29", "g1", "group")
-        assert_eq(await s.has_pushed("2026-06-29", "g1", "group"), True, "已推")
-        # mark_pushed 幂等
-        await s.mark_pushed("2026-06-29", "g1", "group")
-        assert_eq(await s.has_pushed("2026-06-29", "g1", "group"), True, "幂等")
+            u1_all = await s.get_user_messages("u1")
+            assert_eq(len(u1_all), 2, "u1 全部 2 条")
+
+            # 缓存
+            await s.save_analysis_cache(
+                "2026-06-29", "group:g1", {"is_anime_day": True, "k": "v"}
+            )
+            c = await s.get_analysis_cache("2026-06-29", "group:g1")
+            assert_eq(c is not None and c.get("k") == "v", True, "cache 读写")
+
+            # push_log
+            assert_eq(await s.has_pushed("2026-06-29", "g1", "group"), False, "未推")
+            await s.mark_pushed("2026-06-29", "g1", "group")
+            assert_eq(await s.has_pushed("2026-06-29", "g1", "group"), True, "已推")
+            # mark_pushed 幂等
+            await s.mark_pushed("2026-06-29", "g1", "group")
+            assert_eq(await s.has_pushed("2026-06-29", "g1", "group"), True, "幂等")
+
+            # B11:commit_push 事务
+            await s.commit_push(
+                "2026-06-29",
+                "g2",
+                "group",
+                analysis_payload={"is_anime_day": True, "test": 1},
+                scope="group:g2",
+            )
+            assert_eq(await s.has_pushed("2026-06-29", "g2", "group"), True, "B11 commit_push mark")
+            c2 = await s.get_analysis_cache("2026-06-29", "group:g2")
+            assert_eq(c2 is not None and c2.get("test") == 1, True, "B11 commit_push cache")
+        finally:
+            # B7:单连接需要显式关闭,否则 TemporaryDirectory 删不动 db
+            await s.close()
 
 
 def main():

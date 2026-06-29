@@ -1,13 +1,13 @@
 """LLM 分类器:单群单块分析 + 跨群汇总。
 
-所有 LLM 调用都通过 self.context.get_using_provider().text_chat() 完成
-(底层,无副作用;详见 AstrBot 开发指南第 12 章 方法 1)。
+所有 LLM 调用都通过 provider.text_chat() 完成(底层,无副作用;详见开发指南第 12 章 方法 1)。
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import re
+from json import JSONDecoder
 from typing import Any
 
 try:
@@ -16,6 +16,106 @@ except Exception:  # 单元测试环境兜底
     logger = logging.getLogger("astrbot_plugin_anime_daily.classifier")
     if not logger.handlers:
         logging.basicConfig(level=logging.INFO)
+
+# 容错:JSON 里偶发 `,\n}` 的尾逗号 / Markdown ```json 围栏 / 中文引号包裹 / 多余解释文字。
+# 用 raw_decode 从任意位置起解码,失败再尝试清理。
+_JSON_DECODER = JSONDecoder()
+
+
+def _extract_json(text: str) -> dict | None:
+    """B23:从 LLM 文本中尽力提取 JSON 对象。"""
+    if not text:
+        return None
+    text = text.strip()
+
+    # 去掉 Markdown 围栏
+    if text.startswith("```"):
+        text = text.strip("`")
+        # 去掉可能的首行 "json"
+        if "\n" in text:
+            text = text.split("\n", 1)[1] if text.lower().startswith("json") else text
+        text = text.strip().rstrip("`").strip()
+
+    # 1) 整段解析
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # 2) 从任意 `{` 起尝试 raw_decode
+    for i, ch in enumerate(text):
+        if ch == "{":
+            try:
+                obj, _ = _JSON_DECODER.raw_decode(text[i:])
+                return obj
+            except Exception:
+                continue
+
+    # 3) 尾部逗号容错
+    cleaned = text.replace(",}", "}").replace(",]", "]")
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        return None
+
+
+async def _call_llm_once(
+    provider: Any,
+    prompt: str,
+    temperature: float,
+) -> tuple[str | None, str]:
+    """B2:把"调 LLM"和"解析 JSON"拆开。
+
+    返回 (parsed_dict_or_none, raw_text)。
+    LLM 失败抛异常由上层捕获;解析失败由 _extract_json 返回 None。
+    """
+    resp = await provider.text_chat(
+        prompt=prompt,
+        session_id=None,
+        contexts=[],
+        image_urls=[],
+        func_tool=None,
+        system_prompt="你是一个严格的 JSON 输出助手,只输出 JSON,不要任何解释或 Markdown。",
+    )
+    if hasattr(resp, "completion_text") and resp.completion_text:
+        return _extract_json(resp.completion_text), resp.completion_text
+    return None, ""
+
+
+async def _call_llm_with_retry(
+    provider: Any,
+    prompt: str,
+    temperature: float,
+    *,
+    max_retries: int = 2,
+) -> dict | None:
+    """B2:LLM 调用最多 max_retries 次;解析失败也算失败。
+
+    注意:此处不再做"换 prompt 扰动",保持 LLM 行为稳定(成本/准确性平衡)。
+    """
+    last_err: str = ""
+    for attempt in range(max_retries):
+        try:
+            parsed, raw = await _call_llm_once(provider, prompt, temperature)
+        except Exception as e:
+            logger.warning(
+                f"[anime_daily] LLM call attempt {attempt + 1} failed: {e}",
+                exc_info=True,
+            )
+            last_err = str(e)
+            continue
+        if parsed is not None:
+            return parsed
+        # 解析失败:留 raw 用于排错
+        last_err = (raw or "")[:200]
+        logger.warning(
+            f"[anime_daily] LLM JSON parse failed (attempt {attempt + 1}): {last_err!r}"
+        )
+    logger.error(
+        f"[anime_daily] LLM give up after {max_retries} attempts: {last_err}"
+    )
+    return None
+
 
 GROUP_PROMPT_TEMPLATE = """你是群聊动画话题分析助手。下面是群「{group_name}」在 {date} 的**部分**发言 \
 ({chunk_start} ~ {chunk_end},共 {n} 条)。这是全天消息的一个分块,可能存在多轮上下文。
@@ -55,7 +155,8 @@ GLOBAL_PROMPT_TEMPLATE = """你是全服动画话题汇总助手。下面是 {da
 请基于以下结果做跨群汇总(不要再读原始消息):
 
 任务:
-1. 跨群话痨榜:按 anime_msg_count 汇总同一 user_id 在不同群中的发言
+1. 跨群话痨榜:把同一 user_id 在不同群中的 anime_msg_count 合并为一行(总发言数),
+   group_name 字段留空(汇总后不再属于单一群);若同一 user_id 跨群,best_quote 选最精炼的那条
 2. 跨群热门作品:按 work 归一化键汇总 total_count(归一化已在上一阶段完成)
 3. 全服一句话总结
 
@@ -65,8 +166,6 @@ GLOBAL_PROMPT_TEMPLATE = """你是全服动画话题汇总助手。下面是 {da
     {{
       "user_id": "...",
       "user_name": "...",
-      "group_id": "...",
-      "group_name": "...",
       "anime_msg_count": 0,
       "best_quote": "..."
     }}
@@ -80,65 +179,6 @@ GLOBAL_PROMPT_TEMPLATE = """你是全服动画话题汇总助手。下面是 {da
 """
 
 
-_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-
-def _extract_json(text: str) -> dict | None:
-    """从 LLM 文本中尽力提取 JSON 对象。"""
-    if not text:
-        return None
-    # 1) 尝试整段解析
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    # 2) 提取首个 {...} 块
-    m = _JSON_BLOCK_RE.search(text)
-    if not m:
-        return None
-    candidate = m.group(0)
-    try:
-        return json.loads(candidate)
-    except Exception:
-        pass
-    # 3) 容忍尾部逗号等小问题:暴力替换
-    cleaned = re.sub(r",\s*([}\]])", r"\1", candidate)
-    try:
-        return json.loads(cleaned)
-    except Exception:
-        return None
-
-
-async def _call_llm_json(
-    provider: Any,
-    prompt: str,
-    temperature: float,
-) -> dict | None:
-    """调一次 LLM,返回解析后的 JSON;失败返回 None。"""
-    try:
-        resp = await provider.text_chat(
-            prompt=prompt,
-            session_id=None,
-            contexts=[],
-            image_urls=[],
-            func_tool=None,
-            system_prompt="你是一个严格的 JSON 输出助手,只输出 JSON,不要任何解释或 Markdown。",
-        )
-    except Exception as e:
-        logger.warning(f"LLM call failed: {e}", exc_info=True)
-        return None
-
-    # 文本响应
-    text = ""
-    if hasattr(resp, "completion_text") and resp.completion_text:
-        text = resp.completion_text
-    elif hasattr(resp, "role") and resp.role == "tool":
-        # 工具调用型响应,本次不需要
-        return None
-
-    return _extract_json(text)
-
-
 async def analyze_one_chunk(
     provider: Any,
     *,
@@ -146,8 +186,12 @@ async def analyze_one_chunk(
     date: str,
     chunk: list[dict],
     temperature: float,
+    sem: asyncio.Semaphore,
 ) -> dict | None:
-    """对单块调用一次 LLM,返回该块分析结果;失败返回 None。"""
+    """B12:对单块调用一次 LLM,通过信号量限流。
+
+    返回该块分析结果;失败返回 None。
+    """
     if not chunk:
         return None
     msgs_compact = [
@@ -168,13 +212,11 @@ async def analyze_one_chunk(
         n=len(chunk),
         msgs_json=msgs_json,
     )
-    # 重试一次
-    for _ in range(2):
-        result = await _call_llm_json(provider, prompt, temperature)
-        if result is not None:
-            return _normalize_chunk_result(result)
-        logger.warning("LLM JSON parse failed, retrying once...")
-    return None
+    async with sem:
+        result = await _call_llm_with_retry(provider, prompt, temperature)
+    if result is None:
+        return None
+    return _normalize_chunk_result(result)
 
 
 def _normalize_chunk_result(raw: dict) -> dict:
@@ -210,6 +252,10 @@ def _normalize_chunk_result(raw: dict) -> dict:
     }
 
 
+# 复用同一个信号量
+_DEFAULT_SEM = asyncio.Semaphore(3)
+
+
 async def analyze_group_today(
     provider: Any,
     *,
@@ -218,31 +264,43 @@ async def analyze_group_today(
     date: str,
     chunks: list[list[dict]],
     temperature: float,
+    sem: asyncio.Semaphore | None = None,
 ) -> dict | None:
-    """对单个群的所有 chunk 依次调 LLM,然后本地合并。
+    """B3 + B12 + B22:并发跑各 chunk,通过信号量限流。
 
-    返回 merge_partial_results 的输出;若所有 chunk 全部失败则返回 None。
+    返回值:
+      - 正常合并结果 dict(可能 is_anime_day=False 表示无动画)
+      - None 表示"该群所有 chunk 全部失败"——上层应推 error 而非 empty
     """
     if not chunks:
         return None
-    partials: list[dict] = []
-    for i, chunk in enumerate(chunks):
-        logger.info(
-            f"[anime_daily] analyze group={group_id} chunk={i + 1}/{len(chunks)} size={len(chunk)}"
-        )
-        r = await analyze_one_chunk(
+    if sem is None:
+        sem = _DEFAULT_SEM
+
+    tasks = [
+        analyze_one_chunk(
             provider,
             group_name=group_name,
             date=date,
             chunk=chunk,
             temperature=temperature,
+            sem=sem,
         )
+        for chunk in chunks
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    partials: list[dict] = []
+    for i, r in enumerate(results):
         if r is not None:
             partials.append(r)
+        else:
+            logger.warning(
+                f"[anime_daily] chunk {i + 1}/{len(chunks)} of group={group_id} failed"
+            )
+
     if not partials:
         return None
 
-    # 本地合并
     from .aggregator import merge_partial_results  # 避免循环
 
     return merge_partial_results(partials)
@@ -254,8 +312,12 @@ async def aggregate_global(
     date: str,
     successful_groups: list[dict],
     temperature: float,
+    sem: asyncio.Semaphore | None = None,
 ) -> dict | None:
-    """阶段二:基于每群已分析结果,做跨群汇总(LLM 一次)。"""
+    """阶段二:基于每群已分析结果,做跨群汇总(LLM 一次)。
+
+    B5:prompt 要求 LLM 跨群合并 user(输出不再带 group_id),与本地降级保持口径一致。
+    """
     if not successful_groups:
         return None
     groups_compact = [
@@ -271,16 +333,17 @@ async def aggregate_global(
     groups_json = json.dumps(groups_compact, ensure_ascii=False)
     prompt = GLOBAL_PROMPT_TEMPLATE.format(date=date, groups_json=groups_json)
 
-    for _ in range(2):
-        raw = await _call_llm_json(provider, prompt, temperature)
-        if raw is None:
-            logger.warning("Global LLM JSON parse failed, retrying once...")
-            continue
-        return _normalize_global_result(raw)
-    return None
+    if sem is None:
+        sem = _DEFAULT_SEM
+    async with sem:
+        raw = await _call_llm_with_retry(provider, prompt, temperature)
+    if raw is None:
+        return None
+    return _normalize_global_result(raw)
 
 
 def _normalize_global_result(raw: dict) -> dict:
+    """B5:不再带 group_id/group_name(跨群合并后无单一群)。"""
     user_top = []
     for u in raw.get("global_user_top", []) or []:
         if not isinstance(u, dict):
@@ -289,8 +352,6 @@ def _normalize_global_result(raw: dict) -> dict:
             {
                 "user_id": str(u.get("user_id", "")),
                 "user_name": str(u.get("user_name", "") or u.get("user_id", "")),
-                "group_id": str(u.get("group_id", "")),
-                "group_name": str(u.get("group_name", "") or u.get("group_id", "")),
                 "anime_msg_count": int(u.get("anime_msg_count", 0) or 0),
                 "best_quote": str(u.get("best_quote", "") or ""),
             }

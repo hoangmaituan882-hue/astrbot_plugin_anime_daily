@@ -20,9 +20,13 @@ def render_empty(date_str: str, group_id: str, group_name: str | None) -> str:
 
 
 def render_error(date_str: str, group_id: str, group_name: str | None) -> str:
+    """B18:给出可执行建议而非 dead end。"""
     return (
         f"⚠️ {_group_display_name(group_id, group_name)} 今日({date_str})"
-        f"动画分析失败,详情请查看插件日志。"
+        f"动画分析失败。\n"
+        f"可能原因:LLM provider 未启用/网络异常/超时。\n"
+        f"建议:让管理员检查 AstrBot 主日志(关键字 anime_daily),"
+        f"或稍后用 /anime preview 重试。"
     )
 
 
@@ -89,10 +93,12 @@ def render_global_report(
         lines.append(f"🏆 全服话痨 TOP {len(users)}")
         for i, u in enumerate(users, 1):
             name = u.get("user_name") or u.get("user_id", "?")
-            gname = u.get("group_name") or u.get("group_id", "?")
             cnt = int(u.get("anime_msg_count", 0) or 0)
             quote = (u.get("best_quote") or "").strip()
-            line = f"{i}. @{name}({gname}) — {_pad_num(cnt)}"
+            gc = int(u.get("group_count", 0) or 0)
+            line = f"{i}. @{name} — {_pad_num(cnt)}"
+            if gc > 1:
+                line += f"  (跨 {gc} 群)"
             if quote:
                 line += f"  「{_short(quote, 40)}」"
             lines.append(line)

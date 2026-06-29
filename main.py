@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import filter
+from astrbot.api.event import MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 from .aggregator import chunk_messages, merge_global_results
@@ -30,7 +30,7 @@ from .storage import Storage, get_db_path
 
 @register(
     "astrbot_plugin_anime_daily",
-    "your_name",
+    "hoangmaituan882-hue",
     "每天 23:00 自动汇总群内动画话题,生成话痨榜与作品榜。",
     "1.0.0",
     "https://github.com/hoangmaituan882-hue/astrbot_plugin_anime_daily",
@@ -41,56 +41,106 @@ class AnimeDailyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.cfg = PluginConfig.from_raw(dict(config))
-        self.storage = Storage(get_db_path(self._plugin_data_dir()))
-        self.scheduler: DailyScheduler | None = None
+        self._llm_sem: asyncio.Semaphore | None = None
         self._analyzing_lock = asyncio.Lock()
-        # 启动初始化
-        try:
-            loop = asyncio.get_event_loop()
-            loop.create_task(self._async_init())
-        except RuntimeError:
-            # 没有运行中的事件循环,延后到 on_astrbot_loaded
-            pass
+        self._init_lock = asyncio.Lock()
+        self._initialized = False
+        self.storage: Storage | None = None
+        self.scheduler: DailyScheduler | None = None
 
-    def _plugin_data_dir(self) -> str:
-        """推断本插件的数据目录。
+    # ============== 初始化与生命周期(B8) ==============
 
-        优先使用 context 提供的插件数据目录,否则用 AstrBot 的 data 根目录。
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self) -> None:
+        """B8:统一初始化路径。仅在 AstrBot 启动完成时跑一次。"""
+        async with self._init_lock:
+            if self._initialized:
+                return
+            try:
+                db_path = get_db_path(self._resolve_data_dir())
+                self.storage = Storage(db_path)
+                await self.storage.init()
+                # B12:LLM 并发上限
+                self._llm_sem = asyncio.Semaphore(
+                    max(1, self.cfg.max_concurrent_llm)
+                )
+                hh, mm = self.cfg.get_push_hour_minute()
+                self.scheduler = DailyScheduler(
+                    push_hour=hh,
+                    push_minute=mm,
+                    job=self._daily_job,
+                )
+                self.scheduler.start()
+                self._initialized = True
+            except Exception as e:
+                logger.error(
+                    f"[anime_daily] on_astrbot_loaded failed: {e}",
+                    exc_info=True,
+                )
+
+    @filter.on_config_updated()
+    async def on_config_updated(self) -> None:
+        """B9:配置变更时热重载。
+
+        - 重新解析 cfg
+        - 重启 scheduler(应用新的 push_time)
+        - 重新构造 LLM 信号量
         """
+        try:
+            # 重新从当前 config 构造
+            self.cfg = PluginConfig.from_raw(dict(self.config))
+            self._llm_sem = asyncio.Semaphore(
+                max(1, self.cfg.max_concurrent_llm)
+            )
+            if self.scheduler:
+                await self.scheduler.stop()
+            hh, mm = self.cfg.get_push_hour_minute()
+            self.scheduler = DailyScheduler(
+                push_hour=hh,
+                push_minute=mm,
+                job=self._daily_job,
+            )
+            self.scheduler.start()
+            logger.info("[anime_daily] config reloaded")
+        except Exception as e:
+            logger.error(
+                f"[anime_daily] on_config_updated failed: {e}", exc_info=True
+            )
+
+    async def terminate(self) -> None:
+        if self.scheduler:
+            await self.scheduler.stop()
+        if self.storage:
+            await self.storage.close()
+
+    def _resolve_data_dir(self) -> str:
+        """B14:解析本插件数据目录。
+
+        优先使用 Star 提供的 get_data_dir(若可用),否则用 AstrBot 全局 data_dir,
+        兜底用当前工作目录下的 data。
+        """
+        # Star 基类(新版本 AstrBot)提供 get_data_dir
+        try:
+            data_dir = self.get_data_dir()  # type: ignore[attr-defined]
+            if data_dir:
+                return str(data_dir)
+        except Exception:
+            pass
         try:
             data_dir = self.context.get_config().get("data_dir")
             if data_dir:
                 return str(data_dir)
         except Exception:
             pass
-        # 兜底:使用当前工作目录下的 data
         return "data"
 
-    async def _async_init(self) -> None:
-        await self.storage.init()
-        hh, mm = self.cfg.get_push_hour_minute()
-        self.scheduler = DailyScheduler(
-            push_hour=hh,
-            push_minute=mm,
-            job=self._daily_job,
-        )
-        self.scheduler.start()
-
-    async def terminate(self) -> None:
-        if self.scheduler:
-            await self.scheduler.stop()
-
     # ============== 消息采集 ==============
-
-    @filter.on_astrbot_loaded()
-    async def on_astrbot_loaded(self) -> None:
-        """AstrBot 启动完成时兜底初始化。"""
-        if self.scheduler is None:
-            await self._async_init()
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: Any) -> None:
         """静默监听群消息,落库。不发送任何消息。"""
+        if not self._initialized or self.storage is None:
+            return  # 还没初始化完,直接丢弃
         try:
             group_id = event.get_group_id()
             if not group_id:
@@ -101,6 +151,8 @@ class AnimeDailyPlugin(Star):
             if len(text) < self.cfg.quiet_min_words:
                 return
             now_ts = int(datetime.now().timestamp())
+            # B1:同时存 umo,后续推送用
+            umo = getattr(event, "unified_msg_origin", None)
             await self.storage.insert_message(
                 date_str=datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d"),
                 group_id=group_id,
@@ -112,6 +164,7 @@ class AnimeDailyPlugin(Star):
                 if event.message_obj
                 else None,
                 raw_text=text,
+                umo=umo,
                 created_at=now_ts,
             )
         except Exception as e:
@@ -123,6 +176,9 @@ class AnimeDailyPlugin(Star):
 
     async def _daily_job(self, date_str: str, backfill: bool = False) -> None:
         """每日推送主流程:阶段一(每群) + 阶段二(跨群汇总)。"""
+        if self.storage is None or self._llm_sem is None:
+            logger.warning("[anime_daily] daily job: not initialized yet")
+            return
         if self._analyzing_lock.locked():
             logger.warning(
                 f"[anime_daily] daily job for {date_str} skipped: previous still running"
@@ -144,23 +200,26 @@ class AnimeDailyPlugin(Star):
                 "[anime_daily] no LLM provider configured, skip daily push"
             )
             return
+        assert self.storage is not None  # type narrowing
+        storage = self.storage
+        sem = self._llm_sem
+        assert sem is not None
 
         # 拉取当日所有消息
-        msgs_by_group = await self.storage.get_messages_by_group(date_str)
-        all_msgs = await self.storage.get_all_messages(date_str)
+        msgs_by_group = await storage.get_messages_by_group(date_str)
+        all_msgs = await storage.get_all_messages(date_str)
 
         # 阶段一:逐群分析
         group_analyses: dict[str, dict | None] = {}
         for gid, msgs in msgs_by_group.items():
             # 推过则跳过(backfill 模式除外)
-            if not backfill and await self.storage.has_pushed(
+            if not backfill and await storage.has_pushed(
                 date_str, gid, "group"
             ):
-                group_analyses[gid] = await self.storage.get_analysis_cache(
+                cached = await storage.get_analysis_cache(
                     date_str, f"group:{gid}"
                 )
-                if group_analyses[gid] is None:
-                    group_analyses[gid] = None
+                group_analyses[gid] = cached if cached else None
                 continue
 
             if not msgs:
@@ -174,6 +233,7 @@ class AnimeDailyPlugin(Star):
                 date=date_str,
                 chunks=chunks,
                 temperature=self.cfg.llm_temperature,
+                sem=sem,
             )
             group_analyses[gid] = analysis
             if analysis is not None:
@@ -182,30 +242,33 @@ class AnimeDailyPlugin(Star):
                     "group_name": gname,
                     **analysis,
                 }
-                await self.storage.save_analysis_cache(
+                await storage.save_analysis_cache(
                     date_str, f"group:{gid}", payload
                 )
 
-        # 推送各群
-        all_enabled_gids = set(self.cfg.enabled_groups) or set(msgs_by_group.keys())
+        # 推送各群(B10:拆 error / empty 两种语义)
+        all_enabled_gids = set(self.cfg.enabled_groups) or set(
+            msgs_by_group.keys()
+        )
         successful_groups: list[dict] = []
 
         for gid, analysis in group_analyses.items():
             gname = (
-                msgs_by_group[gid][0].get("group_name") if msgs_by_group.get(gid) else gid
+                msgs_by_group[gid][0].get("group_name")
+                if msgs_by_group.get(gid)
+                else gid
             )
             try:
                 if analysis is None:
-                    if self.cfg.push_on_empty or not msgs_by_group.get(gid):
-                        # 失败也推一条 error(只要当天有消息)
-                        if msgs_by_group.get(gid):
-                            await self._safe_push(
-                                gid, render_error(date_str, gid, gname)
+                    # B22:None 语义 = 所有 chunk 全部失败 → 推 error(独立开关)
+                    if self.cfg.push_on_error and msgs_by_group.get(gid):
+                        await self._safe_push(
+                            gid, render_error(date_str, gid, gname)
+                        )
+                        if not backfill:
+                            await storage.mark_pushed(
+                                date_str, gid, "error"
                             )
-                            if not backfill:
-                                await self.storage.mark_pushed(
-                                    date_str, gid, "error"
-                                )
                     continue
                 if not analysis.get("is_anime_day"):
                     if self.cfg.push_on_empty:
@@ -213,7 +276,7 @@ class AnimeDailyPlugin(Star):
                             gid, render_empty(date_str, gid, gname)
                         )
                         if not backfill:
-                            await self.storage.mark_pushed(
+                            await storage.mark_pushed(
                                 date_str, gid, "empty"
                             )
                     continue
@@ -228,7 +291,19 @@ class AnimeDailyPlugin(Star):
                 )
                 await self._safe_push(gid, text)
                 if not backfill:
-                    await self.storage.mark_pushed(date_str, gid, "group")
+                    # B11:把"落缓存 + 记推送"放到一个事务里
+                    payload = {
+                        "group_id": gid,
+                        "group_name": gname,
+                        **analysis,
+                    }
+                    await storage.commit_push(
+                        date_str=date_str,
+                        group_id=gid,
+                        kind="group",
+                        analysis_payload=payload,
+                        scope=f"group:{gid}",
+                    )
                 successful_groups.append(
                     {"group_id": gid, "group_name": gname, **analysis}
                 )
@@ -250,6 +325,7 @@ class AnimeDailyPlugin(Star):
                     date=date_str,
                     successful_groups=successful_groups,
                     temperature=self.cfg.llm_temperature,
+                    sem=sem,
                 )
             except Exception as e:
                 logger.error(
@@ -259,13 +335,13 @@ class AnimeDailyPlugin(Star):
                 global_result = None
 
             if global_result is None:
-                # 降级:本地合并
+                # 降级:本地合并(同样跨群合并 user,口径与 LLM 一致)
                 logger.info(
                     "[anime_daily] global LLM failed, fallback to local merge"
                 )
                 global_result = merge_global_results(successful_groups)
 
-            await self.storage.save_analysis_cache(
+            await storage.save_analysis_cache(
                 date_str, "global", global_result
             )
             text = render_global_report(
@@ -277,13 +353,13 @@ class AnimeDailyPlugin(Star):
             )
             for gid in all_enabled_gids:
                 try:
-                    if not backfill and await self.storage.has_pushed(
+                    if not backfill and await storage.has_pushed(
                         date_str, gid, "global"
                     ):
                         continue
                     await self._safe_push(gid, text)
                     if not backfill:
-                        await self.storage.mark_pushed(
+                        await storage.mark_pushed(
                             date_str, gid, "global"
                         )
                 except Exception as e:
@@ -293,19 +369,21 @@ class AnimeDailyPlugin(Star):
                     )
 
     async def _safe_push(self, group_id: str, text: str) -> None:
-        """通过 context.send_message 发送纯文本;失败仅记日志。"""
+        """B1:用该群最近一条消息的 umo 推送;umo 缺失时降级为日志告警。"""
+        assert self.storage is not None
         try:
-            from astrbot.api.event import MessageChain
-
+            umo = await self.storage.get_latest_umo(group_id)
+            if not umo:
+                logger.warning(
+                    f"[anime_daily] _safe_push({group_id}): no umo cached, "
+                    f"skip (text length={len(text)})"
+                )
+                return
             chain = MessageChain().message(text)
-            # 构造一个伪 unified_msg_origin:群维度
-            # AstrBot 的 send_message 需要 unified_msg_origin 形式;
-            # 这里用 group:<id> 约定,部分平台可能不支持 —— 失败则尝试直接用 platform 的 send
-            umo = f"group:{group_id}"
             await self.context.send_message(umo, chain)
         except Exception as e:
             logger.warning(
-                f"[anime_daily] send_message(group:{group_id}) failed: {e}; "
+                f"[anime_daily] send_message({group_id}) failed: {e}; "
                 f"text length={len(text)}"
             )
 
@@ -319,12 +397,16 @@ class AnimeDailyPlugin(Star):
         target: str = "",
     ):
         """/anime today | group <日期> | user <user_id> [日期] | global [日期] | preview"""
+        if self.storage is None:
+            yield event.plain_result("插件尚未初始化完成,请稍后再试。")
+            return
+        storage = self.storage
         try:
             group_id = event.get_group_id() or ""
             today = datetime.now().strftime("%Y-%m-%d")
 
             if action == "today":
-                payload = await self.storage.get_analysis_cache(
+                payload = await storage.get_analysis_cache(
                     today, f"group:{group_id}"
                 )
                 if not payload:
@@ -350,7 +432,7 @@ class AnimeDailyPlugin(Star):
 
             if action == "group":
                 date_str = self._parse_date(target) or today
-                payload = await self.storage.get_analysis_cache(
+                payload = await storage.get_analysis_cache(
                     date_str, f"group:{group_id}"
                 )
                 if not payload:
@@ -385,7 +467,7 @@ class AnimeDailyPlugin(Star):
                     return
                 uid = m.group(1)
                 date_str = self._parse_date(m.group(2)) if m.group(2) else None
-                rows = await self.storage.get_user_messages(uid, date_str)
+                rows = await storage.get_user_messages(uid, date_str)
                 yield event.plain_result(
                     render_user_record(uid, rows, date_str=date_str)
                 )
@@ -393,7 +475,7 @@ class AnimeDailyPlugin(Star):
 
             if action == "global":
                 date_str = self._parse_date(target) or today
-                payload = await self.storage.get_analysis_cache(
+                payload = await storage.get_analysis_cache(
                     date_str, "global"
                 )
                 if not payload:
@@ -411,7 +493,7 @@ class AnimeDailyPlugin(Star):
                 return
 
             if action == "preview":
-                # 立刻跑一次今日分析,只发送给触发者(私聊或当前会话)
+                # 立刻跑一次今日分析,只发送给触发者
                 yield event.plain_result("⏳ 正在分析今日消息,请稍候...")
                 asyncio.create_task(self._run_preview(today, group_id, event))
                 return
@@ -425,11 +507,18 @@ class AnimeDailyPlugin(Star):
                 "/anime preview"
             )
         except Exception as e:
-            logger.error(f"[anime_daily] /anime command failed: {e}", exc_info=True)
+            logger.error(
+                f"[anime_daily] /anime command failed: {e}", exc_info=True
+            )
             yield event.plain_result(f"查询失败: {e}")
 
-    async def _run_preview(self, date_str: str, group_id: str, event: Any) -> None:
+    async def _run_preview(
+        self, date_str: str, group_id: str, event: Any
+    ) -> None:
         try:
+            if self.storage is None or self._llm_sem is None:
+                await event.send("插件尚未初始化完成。")
+                return
             provider = self.context.get_using_provider()
             if provider is None:
                 await event.send("无 LLM provider,无法 preview。")
@@ -448,8 +537,12 @@ class AnimeDailyPlugin(Star):
                 date=date_str,
                 chunks=chunks,
                 temperature=self.cfg.llm_temperature,
+                sem=self._llm_sem,
             )
-            if analysis is None or not analysis.get("is_anime_day"):
+            if analysis is None:
+                await event.send(render_error(date_str, group_id, gname))
+                return
+            if not analysis.get("is_anime_day"):
                 await event.send(render_empty(date_str, group_id, gname))
                 return
             text = render_group_report(
