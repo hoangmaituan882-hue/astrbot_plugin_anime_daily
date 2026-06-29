@@ -34,6 +34,30 @@ from .scheduler import DailyScheduler
 from .storage import Storage, get_db_path
 
 
+def _safe_filter(name: str):
+    """鲁棒获取 filter 装饰器:框架版本不支持时降级为 identity(不装饰)。
+
+    解决: 用户的 AstrBot 版本如果缺少某个 filter 装饰器(如 on_config_updated、
+    on_astrbot_loaded),插件加载会直接抛 AttributeError,整个插件不可用。
+    通过这个包装,任何缺失的装饰器都被替换为 no-op,插件可以正常加载,
+    缺失的钩子功能只是不生效。
+    """
+    obj = getattr(filter, name, None)
+    if obj is None:
+        logger.warning(
+            f"[anime_daily] filter.{name} not available in this AstrBot "
+            f"version; using no-op decorator"
+        )
+
+        def _noop(*_args, **_kwargs):
+            def _decorator(func):
+                return func
+            return _decorator
+
+        return _noop
+    return obj
+
+
 def _resolve_html_output_dir(plugin: "AnimeDailyPlugin") -> Path:
     """L4:解析 HTML 报告输出目录。
 
@@ -76,7 +100,7 @@ class AnimeDailyPlugin(Star):
 
     # ============== 初始化与生命周期(B8) ==============
 
-    @filter.on_astrbot_loaded()
+    @_safe_filter("on_astrbot_loaded")()
     async def on_astrbot_loaded(self) -> None:
         """B8:统一初始化路径。仅在 AstrBot 启动完成时跑一次。"""
         async with self._init_lock:
@@ -144,7 +168,7 @@ class AnimeDailyPlugin(Star):
 
     # ============== 消息采集 ==============
 
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @_safe_filter("event_message_type")(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: Any) -> None:
         """静默监听群消息,落库。不发送任何消息。"""
         if not self._initialized or self.storage is None:
@@ -480,7 +504,7 @@ class AnimeDailyPlugin(Star):
 
     # ============== 查询指令 ==============
 
-    @filter.command("anime")
+    @_safe_filter("command")("anime")
     async def anime_command(
         self,
         event: Any,

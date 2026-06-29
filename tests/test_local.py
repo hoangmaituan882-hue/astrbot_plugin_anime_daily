@@ -477,6 +477,59 @@ def test_html_save_to_file():
         assert_eq("test_" in path.name, True, "文件名含前缀")
 
 
+# ============== _safe_filter 鲁棒性测试 ==============
+def test_safe_filter_decorator():
+    print("[filter] _safe_filter 鲁棒性")
+    try:
+        import astrbot_plugin_anime_daily.main as M
+    except ModuleNotFoundError:
+        # astrbot 不可用(测试环境),跳过
+        print("  SKIP (astrbot not available)")
+        return
+    from astrbot_plugin_anime_daily.main import _safe_filter
+
+    # 1) 不存在的属性应返回 no-op 装饰器,装饰后函数保持原样
+    class FakeFilter:
+        @staticmethod
+        def command(name):
+            def _deco(f):
+                return f
+            return _deco
+        # 注意: 这里故意不定义 on_config_updated
+
+    saved_filter = M.filter
+    M.filter = FakeFilter
+    try:
+        deco = _safe_filter("on_config_updated")
+        # 用法:@deco() 或 @deco(arg)
+        deco_inst = deco()  # 0 参数调用
+        def my_func():
+            return "original"
+        decorated = deco_inst(my_func)
+        assert_eq(decorated is my_func, True, "缺失装饰器装饰后原函数保留")
+    finally:
+        M.filter = saved_filter
+
+    # 2) 存在的属性应正常返回装饰器
+    class GoodFilter:
+        @staticmethod
+        def on_astrbot_loaded():
+            def deco(func):
+                func.__decorated__ = True
+                return func
+            return deco
+    M.filter = GoodFilter
+    try:
+        deco = _safe_filter("on_astrbot_loaded")
+        deco_inst = deco()
+        def f2():
+            return 1
+        out = deco_inst(f2)
+        assert_eq(getattr(out, "__decorated__", False), True, "存在装饰器生效")
+    finally:
+        M.filter = saved_filter
+
+
 # ============== scheduler ==============
 def test_scheduler_helpers():
     print("[scheduler] helpers")
@@ -602,6 +655,7 @@ def main():
     test_html_renderer_group()
     test_html_renderer_global()
     test_html_save_to_file()
+    test_safe_filter_decorator()
     test_scheduler_helpers()
     test_config_group_list_modes()
     test_config_report_format()
