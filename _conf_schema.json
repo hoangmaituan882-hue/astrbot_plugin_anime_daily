@@ -1,0 +1,67 @@
+{
+    "enabled_groups": {
+        "description": "启用的群 ID 列表,留空表示监听所有有消息的群",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": []
+    },
+    "push_time": {
+        "description": "每日推送时间,格式 HH:MM (24小时制)",
+        "type": "string",
+        "default": "23:00"
+    },
+    "top_n_users": {
+        "description": "本群话痨榜展示人数",
+        "type": "int",
+        "default": 10,
+        "options": [3, 5, 10, 20]
+    },
+    "top_n_works": {
+        "description": "本群热门作品榜展示数",
+        "type": "int",
+        "default": 5,
+        "options": [3, 5, 10]
+    },
+    "top_n_global_users": {
+        "description": "全服话痨榜展示人数",
+        "type": "int",
+        "default": 10,
+        "options": [3, 5, 10, 20]
+    },
+    "top_n_global_works": {
+        "description": "全服热门作品榜展示数",
+        "type": "int",
+        "default": 8,
+        "options": [3, 5, 8, 10]
+    },
+    "include_global_in_group": {
+        "description": "是否在每个启用群额外推送全服总榜",
+        "type": "bool",
+        "default": true
+    },
+    "push_on_empty": {
+        "description": "当日无动画话题时是否发送「今日无动画话题」",
+        "type": "bool",
+        "default": true
+    },
+    "quiet_min_words": {
+        "description": "低于该字数的消息不计入(过滤表情/单字)",
+        "type": "int",
+        "default": 2
+    },
+    "max_messages_per_llm_call": {
+        "description": "单次 LLM 调用接收的最大消息数;超过则按 30 分钟时间窗分块",
+        "type": "int",
+        "default": 300
+    },
+    "llm_temperature": {
+        "description": "LLM 判定温度(越低越稳)",
+        "type": "float",
+        "default": 0.1
+    },
+    "summary_max_words": {
+        "description": "群/全服总结一句话的最大字数",
+        "type": "int",
+        "default": 60
+    }
+}
