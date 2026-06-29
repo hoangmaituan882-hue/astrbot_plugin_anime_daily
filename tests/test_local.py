@@ -47,8 +47,10 @@ def test_config_defaults():
     assert_eq(c.push_time, "23:00", "push_time default")
     assert_eq(c.top_n_users, 10, "top_n_users default")
     assert_eq(c.max_messages_per_llm_call, 300, "max default")
-    assert_eq(c.is_group_enabled(None), True, "None 放行")
-    assert_eq(c.is_group_enabled("g1"), True, "空白名单全放行")
+    assert_eq(c.group_list_mode, "whitelist", "默认 whitelist")
+    assert_eq(c.report_format, "text", "默认 text")
+    assert_eq(c.is_group_enabled(None), False, "L1:None 在 whitelist 下拒绝")
+    assert_eq(c.is_group_enabled("g1"), False, "空白名单(g1 不在)拒绝")
     c2 = PluginConfig.from_raw({"enabled_groups": ["g1"], "top_n_users": 7})
     assert_eq(c2.is_group_enabled("g1"), True, "白名单 g1 放行")
     assert_eq(c2.is_group_enabled("g2"), False, "白名单 g2 拒绝")
@@ -57,6 +59,44 @@ def test_config_defaults():
     assert_eq(c3.get_push_hour_minute(), (7, 30), "解析 07:30")
     c4 = PluginConfig.from_raw({"push_time": "garbage"})
     assert_eq(c4.get_push_hour_minute(), (23, 0), "非法回退")
+
+
+def test_config_group_list_modes():
+    """L1:三种名单模式互斥验证。"""
+    print("[config] group_list_modes")
+    # whitelist
+    cw = PluginConfig.from_raw(
+        {"enabled_groups": ["g1", "g2"], "group_list_mode": "whitelist"}
+    )
+    assert_eq(cw.is_group_enabled("g1"), True, "whitelist g1")
+    assert_eq(cw.is_group_enabled("g3"), False, "whitelist g3")
+    # blacklist
+    cb = PluginConfig.from_raw(
+        {"enabled_groups": ["g1", "g2"], "group_list_mode": "blacklist"}
+    )
+    assert_eq(cb.is_group_enabled("g1"), False, "blacklist g1 拒绝")
+    assert_eq(cb.is_group_enabled("g3"), True, "blacklist g3 放行")
+    # none
+    cn = PluginConfig.from_raw(
+        {"enabled_groups": ["g1"], "group_list_mode": "none"}
+    )
+    assert_eq(cn.is_group_enabled("g1"), True, "none g1 放行")
+    assert_eq(cn.is_group_enabled("g3"), True, "none g3 放行")
+    # 非法 mode 回退到 whitelist
+    cf = PluginConfig.from_raw(
+        {"enabled_groups": ["g1"], "group_list_mode": "garbage"}
+    )
+    assert_eq(cf.group_list_mode, "whitelist", "非法 mode 回退")
+
+
+def test_config_report_format():
+    print("[config] report_format")
+    a = PluginConfig.from_raw({"report_format": "html"})
+    assert_eq(a.report_format, "html", "html 接受")
+    b = PluginConfig.from_raw({"report_format": "TEXT"})
+    assert_eq(b.report_format, "text", "TEXT 大写也归一")
+    c = PluginConfig.from_raw({"report_format": "xml"})
+    assert_eq(c.report_format, "text", "非法格式回退 text")
 
 
 # ============== aggregator.chunk_messages ==============
@@ -358,6 +398,85 @@ def test_renderer_user_record_empty():
     assert_eq("未找到" in text, True, "空记录提示")
 
 
+# ============== html_renderer (L3) ==============
+def test_html_renderer_group():
+    print("[html] render_group_html")
+    from astrbot_plugin_anime_daily.html_renderer import render_group_html
+
+    analysis = {
+        "is_anime_day": True,
+        "anime_user_stats": [
+            {"user_id": "u1", "user_name": "小明", "anime_msg_count": 23,
+             "related_msg_count": 30, "best_quote": "我也觉得孤独摇滚第十集封神!"},
+        ],
+        "top_works": [{"work": "孤独摇滚", "count": 12}],
+        "summary": "群内围绕孤独摇滚 BD 消息与新番前瞻展开热烈讨论。",
+    }
+    html = render_group_html(
+        date_str="2026-06-29",
+        group_id="123456",
+        group_name="番剧同好会",
+        analysis=analysis,
+        top_n_users=10,
+        top_n_works=5,
+        summary_max_words=60,
+    )
+    print("--- group html len ---", len(html))
+    assert_eq("<!DOCTYPE html>" in html, True, "含 DOCTYPE")
+    assert_eq("孤独摇滚" in html, True, "含作品名")
+    assert_eq("小明" in html, True, "含用户名")
+    assert_eq('class="top1"' in html, True, "top1 样式")
+    assert_eq("anime_user_stats" not in html, True, "无原始字段泄漏")
+    # HTML 转义
+    assert_eq("<script>" not in html.lower(), True, "无 script 标签注入风险")
+
+
+def test_html_renderer_global():
+    print("[html] render_global_html")
+    from astrbot_plugin_anime_daily.html_renderer import render_global_html
+    payload = {
+        "global_user_top": [
+            {"user_id": "u1", "user_name": "小蓝", "anime_msg_count": 41,
+             "best_quote": "封神", "group_count": 2},
+        ],
+        "global_works_top": [{"work": "孤独摇滚", "total_count": 78}],
+        "summary": "全服热度爆炸。",
+    }
+    html = render_global_html(
+        date_str="2026-06-29",
+        global_result=payload,
+        top_n_users=10,
+        top_n_works=8,
+        summary_max_words=60,
+    )
+    assert_eq("全服总榜" in html, True, "全服标题")
+    assert_eq("孤独摇滚" in html, True, "全服作品")
+    assert_eq("跨 2 群" in html, True, "跨群徽章")
+
+
+def test_html_save_to_file():
+    print("[html] save_html_to_file")
+    from astrbot_plugin_anime_daily.html_renderer import (
+        render_group_html, save_html_to_file,
+    )
+    import tempfile
+    analysis = {
+        "is_anime_day": True, "anime_user_stats": [],
+        "top_works": [], "summary": "",
+    }
+    html = render_group_html(
+        date_str="2026-06-29", group_id="g1", group_name="g",
+        analysis=analysis, top_n_users=10, top_n_works=5,
+        summary_max_words=60,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = save_html_to_file(html, tmp, prefix="test")
+        assert_eq(path.exists(), True, "文件存在")
+        content = path.read_text(encoding="utf-8")
+        assert_eq(len(content) > 0, True, "内容非空")
+        assert_eq("test_" in path.name, True, "文件名含前缀")
+
+
 # ============== scheduler ==============
 def test_scheduler_helpers():
     print("[scheduler] helpers")
@@ -480,7 +599,12 @@ def main():
     test_renderer_global()
     test_renderer_empty_error()
     test_renderer_user_record_empty()
+    test_html_renderer_group()
+    test_html_renderer_global()
+    test_html_save_to_file()
     test_scheduler_helpers()
+    test_config_group_list_modes()
+    test_config_report_format()
     asyncio.run(test_storage())
     print("\nALL TESTS PASSED")
 

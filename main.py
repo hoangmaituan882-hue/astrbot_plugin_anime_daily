@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
@@ -17,6 +18,11 @@ from astrbot.api.star import Context, Star, register
 from .aggregator import chunk_messages, merge_global_results
 from .classifier import aggregate_global, analyze_group_today
 from .config import PluginConfig
+from .html_renderer import (
+    render_global_html,
+    render_group_html,
+    save_html_to_file,
+)
 from .renderer import (
     render_empty,
     render_error,
@@ -26,6 +32,26 @@ from .renderer import (
 )
 from .scheduler import DailyScheduler
 from .storage import Storage, get_db_path
+
+
+def _resolve_html_output_dir(plugin: "AnimeDailyPlugin") -> Path:
+    """L4:解析 HTML 报告输出目录。
+
+    优先 <data_dir>/astrbot_plugin_anime_daily/html_reports,
+    创建失败兜底到 <cwd>/html_reports。
+    """
+    try:
+        base = Path(plugin._resolve_data_dir())  # type: ignore[attr-defined]
+    except Exception:
+        base = Path("data")
+    out = base / "astrbot_plugin_anime_daily" / "html_reports"
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        return out.resolve()
+    except Exception:
+        fallback = Path("html_reports").resolve()
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
 
 
 @register(
@@ -289,7 +315,28 @@ class AnimeDailyPlugin(Star):
                     top_n_works=self.cfg.top_n_works,
                     summary_max_words=self.cfg.summary_max_words,
                 )
-                await self._safe_push(gid, text)
+                # L4:html 模式生成 .html 文件并发送
+                if (
+                    self.cfg.report_format == "html"
+                    and self.cfg.html_send_as_file
+                ):
+                    html_str = render_group_html(
+                        date_str=date_str,
+                        group_id=gid,
+                        group_name=gname,
+                        analysis=analysis,
+                        top_n_users=self.cfg.top_n_users,
+                        top_n_works=self.cfg.top_n_works,
+                        summary_max_words=self.cfg.summary_max_words,
+                    )
+                    out_path = save_html_to_file(
+                        html_str,
+                        _resolve_html_output_dir(self),
+                        prefix="anime_group",
+                    )
+                    await self._safe_push_html(gid, out_path)
+                else:
+                    await self._safe_push(gid, text)
                 if not backfill:
                     # B11:把"落缓存 + 记推送"放到一个事务里
                     payload = {
@@ -351,13 +398,36 @@ class AnimeDailyPlugin(Star):
                 top_n_works=self.cfg.top_n_global_works,
                 summary_max_words=self.cfg.summary_max_words,
             )
+            # L4:html 模式预生成一次 HTML 文件,所有群共享
+            global_html_path: Path | None = None
+            if self.cfg.report_format == "html":
+                html_str = render_global_html(
+                    date_str=date_str,
+                    global_result=global_result,
+                    top_n_users=self.cfg.top_n_global_users,
+                    top_n_works=self.cfg.top_n_global_works,
+                    summary_max_words=self.cfg.summary_max_words,
+                )
+                global_html_path = save_html_to_file(
+                    html_str,
+                    _resolve_html_output_dir(self),
+                    prefix="anime_global",
+                )
             for gid in all_enabled_gids:
                 try:
                     if not backfill and await storage.has_pushed(
                         date_str, gid, "global"
                     ):
                         continue
-                    await self._safe_push(gid, text)
+                    if (
+                        self.cfg.report_format == "html"
+                        and self.cfg.html_send_as_file
+                        and global_html_path is not None
+                    ):
+                        # 直接发文件
+                        await self._safe_push_html(gid, global_html_path)
+                    else:
+                        await self._safe_push(gid, text)
                     if not backfill:
                         await storage.mark_pushed(
                             date_str, gid, "global"
@@ -369,7 +439,10 @@ class AnimeDailyPlugin(Star):
                     )
 
     async def _safe_push(self, group_id: str, text: str) -> None:
-        """B1:用该群最近一条消息的 umo 推送;umo 缺失时降级为日志告警。"""
+        """B1:用该群最近一条消息的 umo 推送;umo 缺失时降级为日志告警。
+
+        仅负责 text 模式推送。HTML 模式请用 _safe_push_html。
+        """
         assert self.storage is not None
         try:
             umo = await self.storage.get_latest_umo(group_id)
@@ -385,6 +458,40 @@ class AnimeDailyPlugin(Star):
             logger.warning(
                 f"[anime_daily] send_message({group_id}) failed: {e}; "
                 f"text length={len(text)}"
+            )
+
+    async def _safe_push_html(self, group_id: str, html_path: "Path") -> None:
+        """L4:发 .html 文件给某群;失败降级为文本提示。"""
+        assert self.storage is not None
+        try:
+            umo = await self.storage.get_latest_umo(group_id)
+            if not umo:
+                logger.warning(
+                    f"[anime_daily] _safe_push_html({group_id}): no umo cached, "
+                    f"skip (path={html_path})"
+                )
+                return
+            try:
+                from astrbot.core.message.components import File
+                chain = MessageChain(
+                    [File(name=html_path.name, file=str(html_path))]
+                )
+                await self.context.send_message(umo, chain)
+                return
+            except Exception as e:
+                logger.warning(
+                    f"[anime_daily] html File send failed: {e}; "
+                    f"fallback to text"
+                )
+            # 降级
+            chain = MessageChain().message(
+                f"📊 今日动画话题报告已生成(html):\n{html_path}"
+            )
+            await self.context.send_message(umo, chain)
+        except Exception as e:
+            logger.warning(
+                f"[anime_daily] _safe_push_html({group_id}) failed: {e}; "
+                f"path={html_path}"
             )
 
     # ============== 查询指令 ==============
@@ -404,6 +511,27 @@ class AnimeDailyPlugin(Star):
         try:
             group_id = event.get_group_id() or ""
             today = datetime.now().strftime("%Y-%m-%d")
+
+            if action in ("help", "h", "?"):
+                yield event.plain_result(self._build_help_text())
+                return
+
+            if action in ("sid", "id"):
+                # L2:返回当前会话的 unified_msg_origin / platform / group_id
+                umo = getattr(event, "unified_msg_origin", None) or "(空)"
+                platform = getattr(event, "platform", None) or event.get_platform_name() if hasattr(event, "get_platform_name") else "?"
+                gid = event.get_group_id() or "(私聊/无群)"
+                self_id = getattr(event, "self_id", "") or ""
+                msg = (
+                    "🔖 当前会话标识\n"
+                    f"• platform: {platform}\n"
+                    f"• group_id: {gid}\n"
+                    f"• self_id: {self_id}\n"
+                    f"• unified_msg_origin: {umo}\n\n"
+                    "💡 把 unified_msg_origin 复制到插件配置 enabled_groups 即可加入白名单。"
+                )
+                yield event.plain_result(msg)
+                return
 
             if action == "today":
                 payload = await storage.get_analysis_cache(
@@ -498,14 +626,7 @@ class AnimeDailyPlugin(Star):
                 asyncio.create_task(self._run_preview(today, group_id, event))
                 return
 
-            yield event.plain_result(
-                "用法:\n"
-                "/anime today\n"
-                "/anime group <日期>\n"
-                "/anime user <user_id> [日期]\n"
-                "/anime global [日期]\n"
-                "/anime preview"
-            )
+            yield event.plain_result(self._build_help_text())
         except Exception as e:
             logger.error(
                 f"[anime_daily] /anime command failed: {e}", exc_info=True
@@ -571,3 +692,20 @@ class AnimeDailyPlugin(Star):
             return datetime.strptime(s, "%Y-%m-%d").strftime("%Y-%m-%d")
         except Exception:
             return None
+
+    def _build_help_text(self) -> str:
+        """L2:统一帮助文案。"""
+        return (
+            "📚 astrbot_plugin_anime_daily 指令帮助\n\n"
+            "• /anime help       — 显示本帮助\n"
+            "• /anime sid        — 显示当前会话 unified_msg_origin(用于白名单配置)\n"
+            "• /anime today      — 查看本群今日榜单\n"
+            "• /anime group <日期 YYYY-MM-DD> — 查看本群某日榜单\n"
+            "• /anime user <user_id> [日期]   — 查看某用户发言记录\n"
+            "• /anime global [日期]          — 查看全服总榜\n"
+            "• /anime preview   — 立即跑一次今日分析(只发给你,不推群)\n\n"
+            "推送模式: 每天 23:00 自动分析并推送\n"
+            f"当前格式: {self.cfg.report_format}  "
+            f"名单模式: {self.cfg.group_list_mode}\n"
+            "更多配置请在 WebUI「astrbot_plugin_anime_daily」中调整。"
+        )

@@ -1,9 +1,15 @@
 {
     "enabled_groups": {
-        "description": "启用的群 ID 列表,留空表示监听所有有消息的群",
+        "description": "群 ID 列表(白名单或黑名单,语义取决于 group_list_mode)",
         "type": "list",
         "items": {"type": "string"},
         "default": []
+    },
+    "group_list_mode": {
+        "description": "L1:名单模式 — whitelist(只在列表) | blacklist(除列表外) | none(全部启用,忽略列表)",
+        "type": "string",
+        "default": "whitelist",
+        "options": ["whitelist", "blacklist", "none"]
     },
     "push_time": {
         "description": "每日推送时间,格式 HH:MM (24小时制)",
@@ -36,6 +42,17 @@
     },
     "include_global_in_group": {
         "description": "是否在每个启用群额外推送全服总榜",
+        "type": "bool",
+        "default": true
+    },
+    "report_format": {
+        "description": "L4:推送格式 — text(纯文本) | html(Jinja2 HTML 报告,作为文件或链接)",
+        "type": "string",
+        "default": "text",
+        "options": ["text", "html"]
+    },
+    "html_send_as_file": {
+        "description": "L4:html 格式时是否作为 .html 文件发送(关闭则只发本地路径提示)",
         "type": "bool",
         "default": true
     },
