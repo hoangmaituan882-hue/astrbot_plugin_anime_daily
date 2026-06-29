@@ -495,12 +495,13 @@ def test_safe_filter_decorator():
             def _deco(f):
                 return f
             return _deco
-        # 注意: 这里故意不定义 on_config_updated
+        # 注意: 这里故意不定义一个装饰器(比如某个版本里没有的)
 
     saved_filter = M.filter
     M.filter = FakeFilter
     try:
-        deco = _safe_filter("on_config_updated")
+        # 测试缺失的装饰器(用 on_xxx_may_not_exist 这种明显不存在的名字)
+        deco = _safe_filter("on_xxx_may_not_exist")
         # 用法:@deco() 或 @deco(arg)
         deco_inst = deco()  # 0 参数调用
         def my_func():

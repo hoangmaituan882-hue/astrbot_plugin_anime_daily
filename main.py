@@ -2,6 +2,8 @@
 
 每天 23:00 自动汇总当日群内动画话题,生成话痨榜与热门作品榜,并推送全服总榜。
 详细设计见:docs.astrbot.app/dev/star/plugin-new.html(开发指南第 5~7、12、13 章)。
+
+版本: 1.0.1 — AstrBot 框架版本兼容加固
 """
 from __future__ import annotations
 
@@ -33,14 +35,20 @@ from .renderer import (
 from .scheduler import DailyScheduler
 from .storage import Storage, get_db_path
 
+# 版本横幅:加载时打印,用户可在 AstrBot 日志确认当前加载的是哪个版本
+PLUGIN_VERSION = "1.0.1"
+logger.info(
+    f"[anime_daily] loading plugin version {PLUGIN_VERSION} "
+    f"(defensive filter compatibility)"
+)
+
 
 def _safe_filter(name: str):
     """鲁棒获取 filter 装饰器:框架版本不支持时降级为 identity(不装饰)。
 
-    解决: 用户的 AstrBot 版本如果缺少某个 filter 装饰器(如 on_config_updated、
-    on_astrbot_loaded),插件加载会直接抛 AttributeError,整个插件不可用。
-    通过这个包装,任何缺失的装饰器都被替换为 no-op,插件可以正常加载,
-    缺失的钩子功能只是不生效。
+    如果 AstrBot 框架版本缺少某个 filter 装饰器,插件加载会直接抛
+    AttributeError,整个插件不可用。通过这个包装,任何缺失的装饰器都被
+    替换为 no-op,插件可以正常加载,缺失的钩子功能只是不生效。
     """
     obj = getattr(filter, name, None)
     if obj is None:
@@ -82,7 +90,7 @@ def _resolve_html_output_dir(plugin: "AnimeDailyPlugin") -> Path:
     "astrbot_plugin_anime_daily",
     "hoangmaituan882-hue",
     "每天 23:00 自动汇总群内动画话题,生成话痨榜与作品榜。",
-    "1.0.0",
+    "1.0.1",
     "https://github.com/hoangmaituan882-hue/astrbot_plugin_anime_daily",
 )
 class AnimeDailyPlugin(Star):
