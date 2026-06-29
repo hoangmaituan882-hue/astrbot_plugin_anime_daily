@@ -531,6 +531,44 @@ def test_safe_filter_decorator():
         M.filter = saved_filter
 
 
+# ============== _is_ready 鲁棒性测试 ==============
+def test_is_ready_states():
+    """验证 _is_ready 在不同初始状态下正确返回。"""
+    print("[ready] _is_ready 状态机")
+    try:
+        from astrbot_plugin_anime_daily.main import AnimeDailyPlugin
+    except (ModuleNotFoundError, ImportError):
+        # 没有 astrbot 时无法构造完整实例,跳过
+        print("  SKIP (astrbot not available)")
+        return
+
+    # 模拟"未初始化"状态
+    class FakePlugin:
+        _initialized = False
+        storage = None
+        _llm_sem = None
+        scheduler = None
+        _is_ready = AnimeDailyPlugin._is_ready
+
+    p = FakePlugin()
+    assert_eq(p._is_ready(), False, "初始未初始化 → False")
+
+    # 部分就绪(storage 有了但 sem 没有)
+    p.storage = object()
+    assert_eq(p._is_ready(), False, "只 storage → False")
+    p._llm_sem = object()
+    assert_eq(p._is_ready(), False, "storage+sem 但 scheduler=None → False")
+
+    # 全部就绪
+    p.scheduler = object()
+    p._initialized = True
+    assert_eq(p._is_ready(), True, "全部就绪 → True")
+
+    # scheduler 没了
+    p.scheduler = None
+    assert_eq(p._is_ready(), False, "scheduler=None → False")
+
+
 # ============== scheduler ==============
 def test_scheduler_helpers():
     print("[scheduler] helpers")
@@ -657,6 +695,7 @@ def main():
     test_html_renderer_global()
     test_html_save_to_file()
     test_safe_filter_decorator()
+    test_is_ready_states()
     test_scheduler_helpers()
     test_config_group_list_modes()
     test_config_report_format()

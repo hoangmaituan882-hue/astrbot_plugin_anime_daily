@@ -147,6 +147,25 @@ class AnimeDailyPlugin(Star):
         except Exception as e:
             logger.warning(f"[anime_daily] _refresh_config failed: {e}")
 
+    def _is_ready(self) -> bool:
+        """检查插件是否完全就绪(storage / llm_sem / scheduler 都建好)。"""
+        return (
+            self._initialized
+            and self.storage is not None
+            and self._llm_sem is not None
+            and self.scheduler is not None
+        )
+
+    @staticmethod
+    def _not_ready_text() -> str:
+        """用户调用指令但插件未就绪时的友好提示。"""
+        return (
+            "⏳ 插件正在初始化,请稍候片刻再试。\n"
+            "💡 初始化在 AstrBot 启动后立即开始,通常 1~3 秒内完成。\n"
+            "如果长时间仍报此提示,请检查 AstrBot 主日志(关键字 anime_daily)。\n"
+            "📋 也可使用 /anime sid 查看会话 ID 是否被识别。"
+        )
+
     async def terminate(self) -> None:
         if self.scheduler:
             await self.scheduler.stop()
@@ -218,8 +237,10 @@ class AnimeDailyPlugin(Star):
         """每日推送主流程:阶段一(每群) + 阶段二(跨群汇总)。"""
         # B9:执行前刷一次 cfg(用户改完配置下次定时任务生效)
         self._refresh_config()
-        if self.storage is None or self._llm_sem is None:
-            logger.warning("[anime_daily] daily job: not initialized yet")
+        if not self._is_ready():
+            logger.warning(
+                f"[anime_daily] daily job for {date_str}: not initialized yet"
+            )
             return
         if self._analyzing_lock.locked():
             logger.warning(
@@ -520,8 +541,8 @@ class AnimeDailyPlugin(Star):
         target: str = "",
     ):
         """/anime today | group <日期> | user <user_id> [日期] | global [日期] | preview"""
-        if self.storage is None:
-            yield event.plain_result("插件尚未初始化完成,请稍后再试。")
+        if not self._is_ready():
+            yield event.plain_result(self._not_ready_text())
             return
         storage = self.storage
         try:
@@ -677,8 +698,8 @@ class AnimeDailyPlugin(Star):
         self, date_str: str, group_id: str, event: Any
     ) -> None:
         try:
-            if self.storage is None or self._llm_sem is None:
-                await event.send("插件尚未初始化完成。")
+            if not self._is_ready():
+                await event.send(self._not_ready_text())
                 return
             provider = self.context.get_using_provider()
             if provider is None:
