@@ -104,34 +104,16 @@ class AnimeDailyPlugin(Star):
                     exc_info=True,
                 )
 
-    @filter.on_config_updated()
-    async def on_config_updated(self) -> None:
-        """B9:配置变更时热重载。
+    def _refresh_config(self) -> None:
+        """B9:从 self.config 重新解析 cfg(不依赖任何 AstrBot 钩子)。
 
-        - 重新解析 cfg
-        - 重启 scheduler(应用新的 push_time)
-        - 重新构造 LLM 信号量
+        设计依据:AstrBotConfig 继承自 dict,框架在插件重载/重初始化时
+        会注入新的 config 实例,而 self.config 一直指向最新值。
         """
         try:
-            # 重新从当前 config 构造
             self.cfg = PluginConfig.from_raw(dict(self.config))
-            self._llm_sem = asyncio.Semaphore(
-                max(1, self.cfg.max_concurrent_llm)
-            )
-            if self.scheduler:
-                await self.scheduler.stop()
-            hh, mm = self.cfg.get_push_hour_minute()
-            self.scheduler = DailyScheduler(
-                push_hour=hh,
-                push_minute=mm,
-                job=self._daily_job,
-            )
-            self.scheduler.start()
-            logger.info("[anime_daily] config reloaded")
         except Exception as e:
-            logger.error(
-                f"[anime_daily] on_config_updated failed: {e}", exc_info=True
-            )
+            logger.warning(f"[anime_daily] _refresh_config failed: {e}")
 
     async def terminate(self) -> None:
         if self.scheduler:
@@ -202,6 +184,8 @@ class AnimeDailyPlugin(Star):
 
     async def _daily_job(self, date_str: str, backfill: bool = False) -> None:
         """每日推送主流程:阶段一(每群) + 阶段二(跨群汇总)。"""
+        # B9:执行前刷一次 cfg(用户改完配置下次定时任务生效)
+        self._refresh_config()
         if self.storage is None or self._llm_sem is None:
             logger.warning("[anime_daily] daily job: not initialized yet")
             return
@@ -516,6 +500,30 @@ class AnimeDailyPlugin(Star):
                 yield event.plain_result(self._build_help_text())
                 return
 
+            if action in ("reload", "r"):
+                # 主动热重载:刷 cfg + 重启 scheduler(应用 push_time 等)
+                self._refresh_config()
+                if self.scheduler:
+                    try:
+                        await self.scheduler.stop()
+                    except Exception:
+                        pass
+                hh, mm = self.cfg.get_push_hour_minute()
+                self.scheduler = DailyScheduler(
+                    push_hour=hh,
+                    push_minute=mm,
+                    job=self._daily_job,
+                )
+                self.scheduler.start()
+                self._llm_sem = asyncio.Semaphore(
+                    max(1, self.cfg.max_concurrent_llm)
+                )
+                yield event.plain_result(
+                    f"🔄 已重载配置。下次推送时间: {self.cfg.push_time}\n"
+                    f"格式: {self.cfg.report_format}  名单: {self.cfg.group_list_mode}"
+                )
+                return
+
             if action in ("sid", "id"):
                 # L2:返回当前会话的 unified_msg_origin / platform / group_id
                 umo = getattr(event, "unified_msg_origin", None) or "(空)"
@@ -699,6 +707,7 @@ class AnimeDailyPlugin(Star):
             "📚 astrbot_plugin_anime_daily 指令帮助\n\n"
             "• /anime help       — 显示本帮助\n"
             "• /anime sid        — 显示当前会话 unified_msg_origin(用于白名单配置)\n"
+            "• /anime reload     — 重新加载配置(改 push_time 后必用)\n"
             "• /anime today      — 查看本群今日榜单\n"
             "• /anime group <日期 YYYY-MM-DD> — 查看本群某日榜单\n"
             "• /anime user <user_id> [日期]   — 查看某用户发言记录\n"
@@ -707,5 +716,6 @@ class AnimeDailyPlugin(Star):
             "推送模式: 每天 23:00 自动分析并推送\n"
             f"当前格式: {self.cfg.report_format}  "
             f"名单模式: {self.cfg.group_list_mode}\n"
+            "💡 改 push_time / max_concurrent_llm 等配置后,需用 /anime reload 生效。\n"
             "更多配置请在 WebUI「astrbot_plugin_anime_daily」中调整。"
         )
